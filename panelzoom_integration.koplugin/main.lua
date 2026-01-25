@@ -58,6 +58,14 @@ end
 function PanelZoomIntegration:init()
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
+
+    -- Optional: Re-render current panel if document settings change
+    self.onSettingsUpdate = function()
+        if self._current_imgviewer and self.integration_mode then
+            logger.info("PanelZoom: Settings changed, refreshing current panel")
+            self:displayCurrentPanel()
+        end
+    end
 end
 
 -- Callback methods for PanelViewer
@@ -122,12 +130,12 @@ function PanelZoomIntegration:preloadNextPanel()
                     h = math.ceil((next_panel.h or 1) * dim.h)
                 }
                 
-                -- Render the next panel
-                local image = self.ui.document:drawPagePart(page, rect, 0)
+                -- Render the next panel with document settings
+                local image, rotate = self:drawPagePartWithSettings(page, rect)
                 if image then
                     self._preloaded_image = image
                     self._preloaded_panel_index = next_panel_index
-                    logger.info("PanelZoom: Successfully preloaded next panel")
+                    logger.info("PanelZoom: Successfully preloaded next panel with document settings")
                 else
                     logger.warn("PanelZoom: Failed to preload next panel")
                 end
@@ -158,6 +166,81 @@ function PanelZoomIntegration:displayPreloadedPanel()
     UIManager:scheduleIn(0.1, function()
         self:preloadNextPanel()
     end)
+    
+    return true
+end
+
+-- Custom drawPagePart that applies document settings
+function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect)
+    -- 1. Fetch current document settings
+    local doc_cfg = self.ui.document.info.config or {}
+    local gamma = self.ui.view.state.gamma or doc_cfg.gamma or 1.0
+    local contrast = doc_cfg.contrast or 1.0
+    
+    -- 2. Setup scaling/rotation (Keep your existing logic)
+    local CanvasContext = require("document/canvascontext")
+    local canvas_size = CanvasContext:getSize()
+    local rotate = false
+    if G_reader_settings:isTrue("imageviewer_rotate_auto_for_best_fit") then
+        rotate = (canvas_size.w > canvas_size.h) ~= (rect.w > rect.h)
+    end
+    local zoom = rotate and math.min(canvas_size.w / rect.h, canvas_size.h / rect.w) 
+                        or math.min(canvas_size.w / rect.w, canvas_size.h / rect.w)
+    
+    local geom_rect = Geom:new(rect)
+    local scaled_rect = geom_rect:copy()
+    scaled_rect:transformByScale(zoom, zoom)
+    rect.scaled_rect = scaled_rect
+    
+    -- 3. Render the base image
+    -- Note: Passing gamma here handles it at the engine level if supported
+    local tile = self.ui.document:renderPage(pageno, rect, zoom, 0, gamma, true)
+    local image = tile.bb
+    
+    -- 4. Apply Post-Processing (Contrast and Inversion)
+    if image then
+        -- Apply contrast if it's not neutral (1.0)
+        if contrast ~= 1.0 and image.contrast then
+            image:contrast(contrast)
+            logger.info(string.format("PanelZoom: Applied contrast %.2f", contrast))
+        end
+        
+        -- Apply software inversion (Night Mode / Invert Document)
+        if doc_cfg.invert and image.invert then
+            image:invert()
+            logger.info("PanelZoom: Applied image inversion")
+        end
+    end
+
+    return image, rotate
+end
+
+-- Apply KOReader's contrast and gamma settings to image buffer
+-- This can be used for preloaded images or manual refreshes
+function PanelZoomIntegration:applyDocumentSettings(image)
+    if not image then return false end
+    
+    local doc_cfg = self.ui.document.info.config or {}
+    local contrast = doc_cfg.contrast or 1.0
+    local gamma = self.ui.view.state.gamma or doc_cfg.gamma or 1.0
+    
+    -- Contrast
+    if image.contrast and contrast ~= 1.0 then
+        image:contrast(contrast)
+        logger.info(string.format("PanelZoom: Applied contrast %.2f", contrast))
+    end
+    
+    -- Gamma (if not handled during renderPage)
+    if image.gamma and gamma ~= 1.0 then
+        image:gamma(gamma)
+        logger.info(string.format("PanelZoom: Applied gamma %.2f", gamma))
+    end
+    
+    -- Invert
+    if image.invert and doc_cfg.invert then
+        image:invert()
+        logger.info("PanelZoom: Applied image inversion")
+    end
     
     return true
 end
@@ -475,14 +558,14 @@ function PanelZoomIntegration:displayCurrentPanel()
         self._current_imgviewer = nil
     end
     
-    -- Create new image for the panel
-    local image = self.ui.document:drawPagePart(page, rect, 0)
+    -- Create new image for the panel with document settings
+    local image, rotate = self:drawPagePartWithSettings(page, rect)
     if not image then 
         logger.warn("PanelZoom: Could not draw page part")
         return false 
     end
     
-    logger.info("PanelZoom: Successfully created panel image")
+    logger.info("PanelZoom: Successfully created panel image with document settings")
 
     -- Check if we're updating an existing viewer or creating a new one
     if self._current_imgviewer then
