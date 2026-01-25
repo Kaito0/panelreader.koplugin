@@ -1,7 +1,7 @@
 # PanelReader Plugin
-Warning! Tested on Arch Linux and Kindle PW. Kumiko and helper process manga functionality is not tested under Windows / MacOs!
-For safety reasons set these koreader settings - full page, no info shown at bottom, dont crop borders
-Plugin works both in portrait and landscape rotation
+Warning! Tested on Arch Linux and Kindle PW. Kumiko and helper process manga functionality is not tested under Windows / MacOS!
+For safety reasons set these koreader settings - full page, no info shown at bottom, dont crop margins.
+Plugin works both in portrait and landscape rotation.
 
 A comprehensive panel navigation system for KOReader that provides panel-to-panel navigation with support for both Western (LTR) and Japanese (RTL) reading directions.
 
