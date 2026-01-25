@@ -312,6 +312,7 @@ This plugin is designed to work with various panel detection methods. If you hav
 - Tap zone responsiveness  
 - Memory usage optimization
 - QOL improvements
+- Streamlined JSON generation
 
 ## 📄 License
 
