@@ -20,6 +20,7 @@ import subprocess
 import shutil
 import zipfile
 import argparse
+import json
 from pathlib import Path
 
 def create_kumiko_directories():
@@ -285,7 +286,7 @@ def convert_json_to_html(json_file, html_file):
         print(f"   ❌ JSON to HTML conversion failed: {e}")
         return False, None
 
-def combine_htmls_to_json(html_files, output_json):
+def combine_htmls_to_json(html_files, output_json, temp_html_dir, folder_path):
     """Combine multiple HTML files into a single JSON with page-based structure."""
     import json
     import re
@@ -393,36 +394,87 @@ def combine_htmls_to_json(html_files, output_json):
                                 match_str = match_str[:100] + "..."
                             print(f"       JSON {i+1}: {match_str}")
                 # Create empty page data and continue
+                # Try to find the actual image file to determine the correct extension
+                actual_image_name = html_file.stem + ".jpg"  # default
+                
+                # First try flat directory structure
+                for ext in ['.jpg', '.jpeg', '.png']:
+                    for folder in [temp_html_dir, folder_path]:
+                        if (folder / (html_file.stem + ext)).exists():
+                            actual_image_name = html_file.stem + ext
+                            break
+                        if (folder / (html_file.stem + ext.upper())).exists():
+                            actual_image_name = html_file.stem + ext.upper()
+                            break
+                    else:
+                        continue
+                    break
+                
+                # If not found, try subdirectory structure
+                if actual_image_name == html_file.stem + ".jpg":
+                    for img_file in folder_path.rglob(f"{html_file.stem}*"):
+                        if img_file.is_file() and img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                            actual_image_name = str(img_file.relative_to(folder_path))
+                            break
+                
                 page_data = {
                     "page": page_num,
-                    "image": html_file.stem + ".jpg",  # Default image name
+                    "image": actual_image_name,
                     "panels": []
                 }
                 pages_data.append(page_data)
                 continue
             
             # Extract image dimensions from HTML - prioritize actual image size
-            img_patterns = [
-                # Look for "size": [width, height] in the JSON
-                r'"size":\s*\[(\d+)\s*,\s*(\d+)\]',
-                r'"size":\s*\[(\d+\.?\d*)\s*,\s*(\d+\.?\d*)\]',
-                # Alternative formats
-                r'"width":\s*(\d+),\s*"height":\s*(\d+)',
-                r'width:\s*(\d+),\s*height:\s*(\d+)',
-                r'(\d+)\s*x\s*(\d+)',  # e.g., "800x600"
-                # CSS dimensions (lower priority)
-                r'width.*?(\d+).*?height.*?(\d+)'
-            ]
+            # Try to find the actual image file to get dimensions using PIL
+            actual_img_width, actual_img_height = 800, 1200  # fallback
             
-            img_w, img_h = 800, 1200  # Default dimensions
-            for pattern in img_patterns:
-                img_matches = re.findall(pattern, html_content, re.IGNORECASE)
-                if img_matches:
-                    img_w, img_h = map(float, img_matches[0])
-                    print(f"     Image dimensions: {img_w}x{img_h} (from pattern: {pattern[:30]}...)")
-                    break
+            # Look for the image in the temp directory or original folder with better format support
+            # When images are in subdirectories, we need to find the corresponding image file
+            image_extensions = ['.jpg', '.jpeg', '.png']
             
-            # Convert matches to panel format
+            # First try to find image based on HTML file stem (for flat directory structure)
+            for ext in image_extensions:
+                image_name = html_file.stem + ext
+                image_name_upper = html_file.stem + ext.upper()
+                
+                possible_image_paths = [
+                    temp_html_dir / image_name,      # in temp dir
+                    folder_path / image_name,        # in original folder
+                    temp_html_dir / image_name_upper, # uppercase in temp dir
+                    folder_path / image_name_upper,   # uppercase in original folder
+                ]
+                
+                for img_path in possible_image_paths:
+                    if img_path.exists():
+                        try:
+                            from PIL import Image
+                            with Image.open(img_path) as img:
+                                actual_img_width, actual_img_height = img.size
+                                print(f"     Found actual image dimensions: {actual_img_width}x{actual_img_height} from {img_path.name}")
+                                break
+                        except Exception as e:
+                            print(f"     Could not read image {img_path}: {e}")
+                else:
+                    continue
+                break
+            
+            # If not found, try to find any image file that matches the HTML stem (for subdirectory structure)
+            if actual_img_width == 800 and actual_img_height == 1200:  # still using fallback
+                print(f"     Trying to find image for {html_file.stem} in subdirectories...")
+                for img_file in folder_path.rglob(f"{html_file.stem}*"):
+                    if img_file.is_file() and img_file.suffix.lower() in image_extensions:
+                        try:
+                            from PIL import Image
+                            with Image.open(img_file) as img:
+                                actual_img_width, actual_img_height = img.size
+                                print(f"     Found actual image dimensions: {actual_img_width}x{actual_img_height} from {img_file.relative_to(folder_path)}")
+                                break
+                        except Exception as e:
+                            print(f"     Could not read image {img_file}: {e}")
+            
+            img_w, img_h = actual_img_width, actual_img_height
+            
             page_panels = []
             panels_added = 0
             
@@ -488,9 +540,32 @@ def combine_htmls_to_json(html_files, output_json):
                     continue
             
             # Create page data structure
+            # Try to find the actual image file to determine the correct extension
+            actual_image_name = html_file.stem + ".jpg"  # default
+            
+            # First try flat directory structure
+            for ext in ['.jpg', '.jpeg', '.png']:
+                for folder in [temp_html_dir, folder_path]:
+                    if (folder / (html_file.stem + ext)).exists():
+                        actual_image_name = html_file.stem + ext
+                        break
+                    if (folder / (html_file.stem + ext.upper())).exists():
+                        actual_image_name = html_file.stem + ext.upper()
+                        break
+                else:
+                    continue
+                break
+            
+            # If not found, try subdirectory structure
+            if actual_image_name == html_file.stem + ".jpg":
+                for img_file in folder_path.rglob(f"{html_file.stem}*"):
+                    if img_file.is_file() and img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                        actual_image_name = str(img_file.relative_to(folder_path))
+                        break
+            
             page_data = {
                 "page": page_num,
-                "image": html_file.stem + ".jpg",  # Use HTML file name as image name
+                "image": actual_image_name,
                 "panels": page_panels
             }
             pages_data.append(page_data)
@@ -500,9 +575,32 @@ def combine_htmls_to_json(html_files, output_json):
         except Exception as e:
             print(f"   ❌ Error processing {html_file}: {e}")
             # Create empty page data even on error
+            # Try to find the actual image file to determine the correct extension
+            actual_image_name = html_file.stem + ".jpg"  # default
+            
+            # First try flat directory structure
+            for ext in ['.jpg', '.jpeg', '.png']:
+                for folder in [temp_html_dir, folder_path]:
+                    if (folder / (html_file.stem + ext)).exists():
+                        actual_image_name = html_file.stem + ext
+                        break
+                    if (folder / (html_file.stem + ext.upper())).exists():
+                        actual_image_name = html_file.stem + ext.upper()
+                        break
+                else:
+                    continue
+                break
+            
+            # If not found, try subdirectory structure
+            if actual_image_name == html_file.stem + ".jpg":
+                for img_file in folder_path.rglob(f"{html_file.stem}*"):
+                    if img_file.is_file() and img_file.suffix.lower() in ['.jpg', '.jpeg', '.png']:
+                        actual_image_name = str(img_file.relative_to(folder_path))
+                        break
+            
             page_data = {
                 "page": page_num,
-                "image": html_file.stem + ".jpg",
+                "image": actual_image_name,
                 "panels": []
             }
             pages_data.append(page_data)
@@ -585,6 +683,151 @@ def add_normalized_panel(all_panels, x, y, w, h, img_w, img_h):
     print(f"       Added panel: x={panel['x']}, y={panel['y']}, w={panel['w']}, h={panel['h']}")
     return 1
 
+def process_chapter_based_archive(folder_path, output_dir):
+    """Process a CBZ archive with chapter folders for KOReader compatibility."""
+    folder_name = folder_path.name
+    
+    print(f"🔄 Processing chapter-based archive {folder_name}...")
+    
+    # Handle nested structure - check if there's a single nested directory
+    nested_dirs = [d for d in folder_path.iterdir() if d.is_dir()]
+    if len(nested_dirs) == 1:
+        nested_dir = nested_dirs[0]
+        # Check if the nested directory contains chapter directories
+        nested_chapter_dirs = [d for d in nested_dir.iterdir() if d.is_dir()]
+        has_chapters_in_nested = any(
+            any(list(d.glob(f"*{ext}")) or list(d.glob(f"*{ext.upper()}")) 
+                for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp'])
+            for d in nested_chapter_dirs
+        )
+        if has_chapters_in_nested:
+            print(f"   📁 Using nested directory structure: {nested_dir.name}")
+            folder_path = nested_dir
+    
+    # Find all chapter directories (subdirectories containing images)
+    chapter_dirs = []
+    for item in folder_path.iterdir():
+        if item.is_dir():
+            # Check if this directory contains image files
+            has_images = False
+            for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp']:
+                if list(item.glob(f"*{ext}")) or list(item.glob(f"*{ext.upper()}")):
+                    has_images = True
+                    break
+            if has_images:
+                chapter_dirs.append(item)
+    
+    if not chapter_dirs:
+        print(f"❌ No chapter directories with images found in {folder_path}")
+        return False
+    
+    # Sort chapter directories for consistent processing
+    chapter_dirs.sort(key=lambda x: x.name)
+    
+    print(f"   Found {len(chapter_dirs)} chapter directories:")
+    for chapter_dir in chapter_dirs:
+        print(f"     - {chapter_dir.name}/")
+    
+    # Process each chapter separately
+    successful_chapters = 0
+    for chapter_dir in chapter_dirs:
+        print(f"\n📖 Processing chapter: {chapter_dir.name}")
+        
+        # Create chapter-specific output
+        chapter_json = output_dir / f"{folder_name}_{chapter_dir.name}.json"
+        temp_html_dir = output_dir / f"{folder_name}_{chapter_dir.name}_temp"
+        temp_html_dir.mkdir(exist_ok=True)
+        
+        # Get all image files in this chapter
+        image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp']
+        image_files = []
+        
+        for ext in image_extensions:
+            image_files.extend(chapter_dir.glob(f"*{ext}"))
+            image_files.extend(chapter_dir.glob(f"*{ext.upper()}"))
+        
+        # Sort files for consistent processing
+        image_files.sort()
+        
+        if not image_files:
+            print(f"   ⚠️  No image files found in {chapter_dir.name}")
+            continue
+        
+        print(f"   Found {len(image_files)} image files in {chapter_dir.name}")
+        
+        # Process each image in this chapter
+        html_files = []
+        successful_images = 0
+        
+        for image_file in image_files:
+            success, html_file = process_image_with_kumiko(image_file, temp_html_dir)
+            if success and html_file and html_file.exists():
+                html_files.append(html_file)
+                successful_images += 1
+            else:
+                print(f"   ⚠️  Failed to process {image_file.name}")
+        
+        print(f"   Successfully processed {successful_images}/{len(image_files)} images in {chapter_dir.name}")
+        
+        if not html_files:
+            print(f"   ❌ No HTML files were generated for {chapter_dir.name}")
+            continue
+        
+        # Combine all HTML files into single JSON for this chapter
+        success = combine_htmls_to_json(html_files, chapter_json, temp_html_dir, chapter_dir)
+        
+        if success:
+            successful_chapters += 1
+            print(f"   ✅ Chapter {chapter_dir.name} completed successfully")
+        
+        # Clean up temporary HTML files
+        try:
+            import shutil
+            shutil.rmtree(temp_html_dir)
+            print(f"   🧹 Cleaned up temporary files for {chapter_dir.name}")
+        except Exception as e:
+            print(f"   ⚠️  Could not clean up temp files for {chapter_dir.name}: {e}")
+    
+    print(f"\n📊 Successfully processed {successful_chapters}/{len(chapter_dirs)} chapters")
+    
+    if successful_chapters == 0:
+        print(f"❌ No chapters were processed successfully")
+        return False
+    
+    # Create a master index file that lists all chapters
+    master_index = {
+        "archive_name": folder_name,
+        "total_chapters": successful_chapters,
+        "chapters": [],
+        "reading_direction": "rtl"
+    }
+    
+    for chapter_dir in chapter_dirs:
+        chapter_json = output_dir / f"{folder_name}_{chapter_dir.name}.json"
+        if chapter_json.exists():
+            # Read the chapter JSON to get page count
+            try:
+                with open(chapter_json, 'r', encoding='utf-8') as f:
+                    chapter_data = json.load(f)
+                master_index["chapters"].append({
+                    "name": chapter_dir.name,
+                    "json_file": f"{folder_name}_{chapter_dir.name}.json",
+                    "total_pages": chapter_data.get("total_pages", 0)
+                })
+            except Exception as e:
+                print(f"   ⚠️  Could not read chapter JSON for {chapter_dir.name}: {e}")
+    
+    # Write master index
+    master_json = output_dir / f"{folder_name}.json"
+    try:
+        with open(master_json, 'w', encoding='utf-8') as f:
+            json.dump(master_index, f, indent=2, ensure_ascii=False)
+        print(f"✅ Created master index: {master_json}")
+        return True
+    except Exception as e:
+        print(f"❌ Error writing master index: {e}")
+        return False
+
 def process_with_kumiko(folder_path, output_dir):
     """Process a folder with Kumiko by processing each image separately."""
     folder_name = folder_path.name
@@ -594,22 +837,32 @@ def process_with_kumiko(folder_path, output_dir):
     
     print(f"🔄 Processing folder {folder_name} with individual image processing...")
     
-    # Get all image files in the folder
+    # Get all image files in the folder and subdirectories
     image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp']
     image_files = []
     
     for ext in image_extensions:
-        image_files.extend(folder_path.glob(f"*{ext}"))
-        image_files.extend(folder_path.glob(f"*{ext.upper()}"))
+        # Search in current folder and all subdirectories
+        image_files.extend(folder_path.rglob(f"*{ext}"))
+        image_files.extend(folder_path.rglob(f"*{ext.upper()}"))
     
     # Sort files for consistent processing
     image_files.sort()
     
     if not image_files:
-        print(f"❌ No image files found in {folder_path}")
+        print(f"❌ No image files found in {folder_path} or its subdirectories")
+        print(f"   Contents of {folder_path}:")
+        try:
+            for item in folder_path.rglob("*"):
+                if item.is_file():
+                    print(f"     - {item.relative_to(folder_path)}")
+                elif item.is_dir():
+                    print(f"     📁 {item.relative_to(folder_path)}/")
+        except Exception as e:
+            print(f"     Could not list contents: {e}")
         return False
     
-    print(f"   Found {len(image_files)} image files")
+    print(f"   Found {len(image_files)} image files in {folder_path} and subdirectories")
     
     # Process each image separately
     html_files = []
@@ -635,7 +888,7 @@ def process_with_kumiko(folder_path, output_dir):
         print(f"     - {html_file.name}")
     
     # Combine all HTML files into single JSON
-    success = combine_htmls_to_json(html_files, output_json)
+    success = combine_htmls_to_json(html_files, output_json, temp_html_dir, folder_path)
     
     # Clean up temporary HTML files
     try:
@@ -646,6 +899,49 @@ def process_with_kumiko(folder_path, output_dir):
         print(f"⚠️  Could not clean up temp files: {e}")
     
     return success
+
+def is_chapter_based_archive(folder_path):
+    """Check if a folder contains chapter directories (KOReader-style structure)."""
+    if not folder_path.is_dir():
+        return False
+    
+    print(f"   🔍 Checking for chapter-based structure in {folder_path}")
+    
+    # Count subdirectories that contain images
+    chapter_dirs = 0
+    image_files_in_root = 0
+    
+    # First, check if there's a nested structure (e.g., 3/3/ch1, 3/3/ch2)
+    nested_dirs = [d for d in folder_path.iterdir() if d.is_dir()]
+    
+    # If there's only one subdirectory, check inside it for chapters
+    if len(nested_dirs) == 1:
+        nested_dir = nested_dirs[0]
+        print(f"   📁 Found single nested directory: {nested_dir.name}, checking inside...")
+        folder_path = nested_dir
+    
+    for item in folder_path.iterdir():
+        if item.is_dir():
+            # Check if this subdirectory contains images
+            has_images = False
+            image_count = 0
+            for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp']:
+                images = list(item.glob(f"*{ext}")) + list(item.glob(f"*{ext.upper()}"))
+                image_count += len(images)
+                if images:
+                    has_images = True
+                    break
+            if has_images:
+                chapter_dirs += 1
+                print(f"   📖 Found chapter directory: {item.name} with {image_count} images")
+        elif item.is_file() and item.suffix.lower() in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp']:
+            image_files_in_root += 1
+    
+    print(f"   📊 Found {chapter_dirs} chapter directories and {image_files_in_root} images in root")
+    
+    # Consider it chapter-based if there are multiple chapter directories
+    # Also consider it chapter-based if there's at least 1 chapter directory and few/no images in root
+    return chapter_dirs >= 2 or (chapter_dirs >= 1 and image_files_in_root <= 2)
 
 def process_input(input_path, pages_dir, panel_result_dir):
     """Process input path (folder or archive)."""
@@ -664,13 +960,23 @@ def process_input(input_path, pages_dir, panel_result_dir):
         if not extract_archive(input_path, extract_folder):
             return False
         
-        # Process extracted folder
-        return process_with_kumiko(extract_folder, panel_result_dir)
+        # Check if this is a chapter-based archive (KOReader style)
+        if is_chapter_based_archive(extract_folder):
+            print(f"📚 Detected chapter-based archive structure")
+            return process_chapter_based_archive(extract_folder, panel_result_dir)
+        else:
+            print(f"📖 Processing as standard archive")
+            return process_with_kumiko(extract_folder, panel_result_dir)
         
     elif input_path.is_dir():
-        # Process folder directly
-        print(f"📁 Processing folder: {input_path}")
-        return process_with_kumiko(input_path, panel_result_dir)
+        # Check if this is a chapter-based directory
+        if is_chapter_based_archive(input_path):
+            print(f"📚 Detected chapter-based directory structure")
+            return process_chapter_based_archive(input_path, panel_result_dir)
+        else:
+            # Process folder directly
+            print(f"📁 Processing folder: {input_path}")
+            return process_with_kumiko(input_path, panel_result_dir)
         
     else:
         print(f"❌ Unsupported input type: {input_path}")

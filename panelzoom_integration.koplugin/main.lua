@@ -435,11 +435,21 @@ function PanelZoomIntegration:importToggleZoomPanels()
     local doc_path = self.ui.document.file
     if not doc_path then return end
     
+    -- Extract directory and base name early for use in cache check
+    local dir, filename = util.splitFilePathName(doc_path)
+    local base_name = filename:match("(.+)%..+$") or filename
+    
     -- Check cache first
     if self._panel_cache[doc_path] then
         logger.info("PanelZoom: Using cached JSON for " .. doc_path)
         local cached_data = self._panel_cache[doc_path]
         self.reading_direction = cached_data.reading_direction or "ltr"
+        
+        -- Check if this is a chapter-based master index in cache
+        if cached_data.chapters and type(cached_data.chapters) == "table" and #cached_data.chapters > 0 then
+            logger.info("PanelZoom: Using cached chapter-based archive structure")
+            return self:loadChapterBasedPanels(cached_data, dir, base_name)
+        end
         
         local page_idx = self:getSafePageNumber()
         local panels = nil
@@ -466,8 +476,6 @@ function PanelZoomIntegration:importToggleZoomPanels()
     end
     
     -- Not in cache, load from file
-    local dir, filename = util.splitFilePathName(doc_path)
-    local base_name = filename:match("(.+)%..+$") or filename
     local json_path = dir .. "/" .. base_name .. ".json"
     
     local f = io.open(json_path, "r")
@@ -481,6 +489,12 @@ function PanelZoomIntegration:importToggleZoomPanels()
     
     local ok, data = pcall(json.decode, content)
     if not ok or not data then return end
+
+    -- Check if this is a chapter-based master index
+    if data.chapters and type(data.chapters) == "table" and #data.chapters > 0 then
+        logger.info("PanelZoom: Detected chapter-based archive structure")
+        return self:loadChapterBasedPanels(data, dir, base_name)
+    end
 
     -- Cache the parsed JSON
     self._panel_cache[doc_path] = data
@@ -522,6 +536,83 @@ function PanelZoomIntegration:importToggleZoomPanels()
     else
         self.current_panels = {}
         logger.warn(string.format("PanelZoom: JSON found, but no panels match page %d or filename %s", page_idx, filename))
+    end
+end
+
+function PanelZoomIntegration:loadChapterBasedPanels(master_data, dir, base_name)
+    logger.info("PanelZoom: Loading chapter-based panels")
+    
+    -- Cache the master data
+    local doc_path = self.ui.document.file
+    self._panel_cache[doc_path] = master_data
+    
+    -- Save the reading direction
+    self.reading_direction = master_data.reading_direction or "ltr"
+    logger.info(string.format("PanelZoom: Reading direction set to %s", self.reading_direction))
+    
+    local page_idx = self:getSafePageNumber()
+    local current_page_in_chapter = page_idx
+    local cumulative_pages = 0
+    
+    -- Find which chapter contains the current page
+    local target_chapter = nil
+    for _, chapter in ipairs(master_data.chapters) do
+        if current_page_in_chapter <= chapter.total_pages then
+            target_chapter = chapter
+            break
+        else
+            current_page_in_chapter = current_page_in_chapter - chapter.total_pages
+        end
+    end
+    
+    if not target_chapter then
+        logger.warn(string.format("PanelZoom: Could not find chapter for page %d", page_idx))
+        self.current_panels = {}
+        return
+    end
+    
+    logger.info(string.format("PanelZoom: Found chapter %s for page %d (page %d in chapter)", 
+        target_chapter.name, page_idx, current_page_in_chapter))
+    
+    -- Load the chapter JSON file
+    local chapter_json_path = dir .. "/" .. target_chapter.json_file
+    local chapter_file = io.open(chapter_json_path, "r")
+    if not chapter_file then 
+        logger.warn("PanelZoom: Chapter JSON not found at " .. chapter_json_path)
+        self.current_panels = {}
+        return 
+    end
+    
+    local chapter_content = chapter_file:read("*all")
+    chapter_file:close()
+    
+    local ok, chapter_data = pcall(json.decode, chapter_content)
+    if not ok or not chapter_data then 
+        logger.warn("PanelZoom: Failed to parse chapter JSON")
+        self.current_panels = {}
+        return 
+    end
+    
+    -- Find panels for the current page within the chapter
+    local panels = nil
+    if chapter_data.pages and type(chapter_data.pages) == "table" and #chapter_data.pages > 0 then
+        for _, page_data in ipairs(chapter_data.pages) do
+            if page_data.page == current_page_in_chapter then
+                panels = page_data.panels
+                logger.info(string.format("PanelZoom: Found page %d in chapter %s", current_page_in_chapter, target_chapter.name))
+                break
+            end
+        end
+    end
+    
+    if panels and #panels > 0 then
+        self.current_panels = panels
+        logger.info(string.format("PanelZoom: SUCCESS! Loaded %d panels for page %d from chapter %s", 
+            #panels, page_idx, target_chapter.name))
+    else
+        self.current_panels = {}
+        logger.warn(string.format("PanelZoom: Chapter JSON found, but no panels match page %d in chapter %s", 
+            current_page_in_chapter, target_chapter.name))
     end
 end
 
