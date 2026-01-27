@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Manga Processing Script with Pydantic V2 Schema Enforcement
+Manga Processing Script
 Processes manga folders/archives to generate panel data with ordered_detection.py.
 
 Usage:
@@ -12,10 +12,6 @@ Features:
 - Processes each folder with ordered_detection.py
 - Generates JSON files with normalized coordinates
 - Supports RTL reading direction
-- Pydantic V2 schema validation for data integrity
-- OpenCV support for image processing
-- Recursive image search in Pages directory
-- Comprehensive image format support (.jpg, .jpeg, .png, .bmp, .gif, .webp)
 """
 
 import os
@@ -25,92 +21,7 @@ import shutil
 import zipfile
 import argparse
 import json
-import cv2
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Union
-
-# Pydantic V2 imports for schema enforcement
-from pydantic import BaseModel, Field, field_validator, model_validator, ValidationError
-from pydantic.types import confloat, conint
-
-# ============================================================================
-# PYDANTIC V2 SCHEMA DEFINITIONS
-# ============================================================================
-
-# Panel coordinates schema (normalized 0-1 range)
-class PanelCoordinates(BaseModel):
-    x: confloat(ge=0.0, le=1.0)  # Normalized X coordinate
-    y: confloat(ge=0.0, le=1.0)  # Normalized Y coordinate
-    w: confloat(ge=0.0, le=1.0)  # Normalized width
-    h: confloat(ge=0.0, le=1.0)  # Normalized height
-
-# Page data schema
-class PageData(BaseModel):
-    page: conint(ge=1)           # Page number (1-based)
-    image: str                   # Image filename
-    panels: List[PanelCoordinates]  # List of panel coordinates
-    
-    @field_validator('panels')
-    @classmethod
-    def validate_panels(cls, v):
-        if not v:
-            raise ValueError('At least one panel is required')
-        return v
-    
-    def panel_count(self) -> int:
-        """Return the number of panels on this page."""
-        return len(self.panels)
-    
-    def total_panel_area(self) -> float:
-        """Calculate total area covered by panels on this page."""
-        return sum(panel.w * panel.h for panel in self.panels)
-
-# Chapter data schema
-class ChapterData(BaseModel):
-    reading_direction: str = Field(default="rtl", pattern="^(ltr|rtl)$")
-    total_pages: conint(ge=0)   # Total number of pages
-    pages: List[PageData]        # List of page data
-    
-    @field_validator('pages')
-    @classmethod
-    def validate_pages(cls, v):
-        if not v:
-            raise ValueError('At least one page is required')
-        return v
-    
-    @model_validator(mode='after')
-    def validate_page_numbers(self):
-        """Ensure page numbers are sequential and start from 1."""
-        if self.pages:
-            page_numbers = [page.page for page in self.pages]
-            if page_numbers != list(range(1, len(page_numbers) + 1)):
-                raise ValueError('Page numbers must be sequential starting from 1')
-        return self
-
-    def get_page(self, page_num: int) -> Optional[PageData]:
-        """Get page data by page number."""
-        for page in self.pages:
-            if page.page == page_num:
-                return page
-        return None
-    
-    def total_panels(self) -> int:
-        """Get total number of panels across all pages."""
-        return sum(page.panel_count() for page in self.pages)
-
-# Manga index schema for chapter-based archives
-class MangaIndex(BaseModel):
-    archive_name: str
-    total_chapters: conint(ge=0)
-    chapters: List[Dict[str, Any]]  # Chapter information
-    reading_direction: str = Field(default="rtl", pattern="^(ltr|rtl)$")
-    
-    @field_validator('chapters')
-    @classmethod
-    def validate_chapters(cls, v):
-        if not v:
-            raise ValueError('At least one chapter is required')
-        return v
 
 def create_directories():
     """Create Pages and panel_result folders."""
