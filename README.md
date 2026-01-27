@@ -16,7 +16,7 @@ To ensure the plugin works correctly, apply the following settings:
 
 ---
 
-Avaliable detection algoritmms:
+## Avaliable detection algoritmms:
 
 * Kumiko - fastest, cpu
 * YOLO - min 1050 ti 4gb - CUDA*
