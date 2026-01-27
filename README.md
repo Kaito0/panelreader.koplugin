@@ -20,7 +20,7 @@ To ensure the plugin works correctly, apply the following settings:
 
 * Kumiko - opencv, cpu - fast, simple layouts
 * YOLO - min 1050 ti 4gb - CUDA*
-* MAGI - min 1050 ti 4gb - CUDA* - overall best result
+* MAGI - min 1050 ti 4gb - CUDA* 
 
 NVIDIA Driver: Version 530+ (for CUDA 12 support).
 CUDA Toolkit: 11.8 for older cards like the 1050 Ti
