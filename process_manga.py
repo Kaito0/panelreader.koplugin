@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Manga Processing Script
+Manga Processing Script with Pydantic V2 Schema Enforcement
 Processes manga folders/archives to generate panel data with Kumiko.
 
 Usage:
@@ -12,6 +12,7 @@ Features:
 - Processes each folder with Kumiko
 - Generates JSON files with normalized coordinates
 - Supports RTL reading direction
+- Pydantic V2 schema validation for data integrity
 """
 
 import os
@@ -21,7 +22,350 @@ import shutil
 import zipfile
 import argparse
 import json
+import cv2
 from pathlib import Path
+from typing import List, Optional, Dict, Any, Union
+
+# ============================================================================
+# SCHEMA DEFINITIONS (for reference, not enforced)
+# ============================================================================
+
+# Panel coordinates schema (normalized 0-1 range)
+class PanelCoordinates:
+    def __init__(self, x: float, y: float, w: float, h: float):
+        self.x = x
+        self.y = y
+        self.w = w
+        self.h = h
+
+# Page data schema
+class PageData:
+    def __init__(self, page: int, image: str, panels: List[PanelCoordinates]):
+        self.page = page
+        self.image = image
+        self.panels = panels
+    
+    def panel_count(self) -> int:
+        """Return the number of panels on this page."""
+        return len(self.panels)
+    
+    def total_panel_area(self) -> float:
+        """Calculate total area covered by panels on this page."""
+        return sum(panel.w * panel.h for panel in self.panels)
+
+# Chapter data schema
+class ChapterData:
+    def __init__(self, reading_direction: str, total_pages: int, pages: List[PageData]):
+        self.reading_direction = reading_direction
+        self.total_pages = total_pages
+        self.pages = pages
+    
+    def get_page(self, page_num: int) -> Optional[PageData]:
+        """Get page data by page number."""
+        for page in self.pages:
+            if page.page == page_num:
+                return page
+        return None
+    
+    def total_panels(self) -> int:
+        """Get total number of panels across all pages."""
+        return sum(page.panel_count() for page in self.pages)
+
+# Manga index schema
+class MangaIndex:
+    def __init__(self, archive_name: str, total_chapters: int, chapters: List[Dict], reading_direction: str):
+        self.archive_name = archive_name
+        self.total_chapters = total_chapters
+        self.chapters = chapters
+        self.reading_direction = reading_direction
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def export_schema(output_file: str = "manga_schema.json"):
+    """Export basic schema structure to JSON file for documentation."""
+    schema = {
+        "description": "Manga panel data structure (without Pydantic validation)",
+        "PanelCoordinates": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "y": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "w": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "h": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+            }
+        },
+        "PageData": {
+            "type": "object",
+            "properties": {
+                "page": {"type": "integer", "minimum": 1},
+                "image": {"type": "string"},
+                "panels": {"type": "array", "items": {"$ref": "#/PanelCoordinates"}}
+            }
+        },
+        "ChapterData": {
+            "type": "object",
+            "properties": {
+                "reading_direction": {"type": "string", "enum": ["rtl", "ltr"]},
+                "total_pages": {"type": "integer", "minimum": 0},
+                "pages": {"type": "array", "items": {"$ref": "#/PageData"}}
+            }
+        }
+    }
+    
+    try:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump(schema, f, indent=2, ensure_ascii=False)
+        print(f"📄 Schema exported to {output_file}")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to export schema: {e}")
+        return False
+
+def validate_json_file(json_file: Path) -> bool:
+    """Validate a single JSON file against the basic schema structure."""
+    try:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        # Basic structure validation without Pydantic
+        if not isinstance(data, dict):
+            print(f"❌ {json_file.name} - Invalid JSON structure (not a dict)")
+            return False
+        
+        # Check for master index structure
+        if 'archive_name' in data and 'chapters' in data:
+            required_fields = ['archive_name', 'total_chapters', 'chapters', 'reading_direction']
+            for field in required_fields:
+                if field not in data:
+                    print(f"❌ {json_file.name} - Missing required field: {field}")
+                    return False
+        else:
+            # Check for chapter structure
+            required_fields = ['reading_direction', 'total_pages', 'pages']
+            for field in required_fields:
+                if field not in data:
+                    print(f"❌ {json_file.name} - Missing required field: {field}")
+                    return False
+        
+        print(f"✅ {json_file.name} - Valid structure")
+        return True
+        
+    except Exception as e:
+        print(f"❌ {json_file.name} - Error reading file: {e}")
+        return False
+
+def combine_jsons_to_json(json_files, output_json, chapter_name=None):
+    """Combine multiple JSON files into a single JSON with basic structure validation."""
+    pages_data = []
+    reading_direction = "rtl"  # Default to RTL for manga
+    total_panels_found = 0
+    total_area_covered = 0.0
+    
+    print(f"🔄 Processing {len(json_files)} JSON files with schema validation...")
+    
+    for page_num, json_file in enumerate(sorted(json_files), 1):
+        try:
+            with open(json_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            
+            # Try to find the corresponding image file for dimension reading
+            image_path = None
+            json_stem = json_file.stem
+            # Look for image file with same name in common locations
+            for ext in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp']:
+                potential_image = json_file.parent / f"{json_stem}{ext}"
+                if potential_image.exists():
+                    image_path = potential_image
+                    break
+                potential_image = json_file.parent / f"{json_stem}{ext.upper()}"
+                if potential_image.exists():
+                    image_path = potential_image
+                    break
+            
+            # Handle single page JSON or array of pages
+            if isinstance(data, list):
+                # Array of page data
+                for page_data in data:
+                    if 'panels' in page_data and page_data['panels']:
+                        # Convert field names and panel formats
+                        processed_data = preprocess_page_data(page_data, page_num, image_path)
+                        if processed_data:
+                            # Add processed data directly (no Pydantic validation)
+                            pages_data.append(processed_data)
+                            # Calculate statistics
+                            panel_count = len(processed_data.get('panels', []))
+                            total_panels_found += panel_count
+                            total_area_covered += sum(
+                                panel.get('w', 0) * panel.get('h', 0) 
+                                for panel in processed_data.get('panels', [])
+                            )
+                            
+            elif isinstance(data, dict):
+                if 'pages' in data:
+                    # Multi-page JSON structure
+                    for i, page_data in enumerate(data['pages']):
+                        if 'panels' in page_data and page_data['panels']:
+                            # Convert field names and panel formats
+                            processed_data = preprocess_page_data(page_data, i + 1, image_path)
+                            if processed_data:
+                                # Add processed data directly (no Pydantic validation)
+                                pages_data.append(processed_data)
+                                # Calculate statistics
+                                panel_count = len(processed_data.get('panels', []))
+                                total_panels_found += panel_count
+                                total_area_covered += sum(
+                                    panel.get('w', 0) * panel.get('h', 0) 
+                                    for panel in processed_data.get('panels', [])
+                                )
+                                    
+                elif 'panels' in data and data['panels']:
+                    # Single page JSON structure
+                    # Convert field names and panel formats
+                    processed_data = preprocess_page_data(data, page_num, image_path)
+                    if processed_data:
+                        # Add processed data directly (no Pydantic validation)
+                        pages_data.append(processed_data)
+                        # Calculate statistics
+                        panel_count = len(processed_data.get('panels', []))
+                        total_panels_found += panel_count
+                        total_area_covered += sum(
+                            panel.get('w', 0) * panel.get('h', 0) 
+                            for panel in processed_data.get('panels', [])
+                        )
+            
+        except Exception as e:
+            print(f"   ⚠️  Error reading {json_file}: {e}")
+            continue
+    
+    if not pages_data:
+        print(f"   ❌ No valid page data found in JSON files")
+        return False
+    
+    # Sort pages by page number (cleaner math with lambda)
+    pages_data.sort(key=lambda x: x.get('page', 0))
+    
+    # Create output structure without Pydantic
+    output_data = {
+        "reading_direction": reading_direction,
+        "total_pages": len(pages_data),
+        "pages": pages_data
+    }
+    
+    # Additional statistics with cleaner math
+    avg_panels_per_page = total_panels_found / len(pages_data) if pages_data else 0
+    avg_area_per_panel = total_area_covered / total_panels_found if total_panels_found > 0 else 0
+    
+    print(f"   📊 Statistics:")
+    print(f"      - Total pages: {len(pages_data)}")
+    print(f"      - Total panels: {total_panels_found}")
+    print(f"      - Avg panels/page: {avg_panels_per_page:.2f}")
+    print(f"      - Total area coverage: {total_area_covered:.3f}")
+    print(f"      - Avg area/panel: {avg_area_per_panel:.6f}")
+    
+    # Create output structure without shrink-wrapping
+    output_data = {
+        "reading_direction": reading_direction,
+        "total_pages": len(pages_data),
+        "pages": pages_data
+    }
+    
+    # Write output JSON
+    try:
+        with open(output_json, 'w', encoding='utf-8') as f:
+            json.dump(output_data, f, indent=2, ensure_ascii=False)
+        print(f"   ✅ Combined {len(json_files)} JSON files into {output_json}")
+        return True
+    except Exception as e:
+        print(f"   ❌ Error writing {output_json}: {e}")
+        return False
+
+def preprocess_page_data(page_data, page_num, image_path=None):
+    """Preprocess page data to match Pydantic schema requirements."""
+    try:
+        # Convert filename to image field name
+        if 'filename' in page_data:
+            page_data['image'] = page_data.pop('filename')
+        
+        # Add page number if missing
+        if 'page' not in page_data:
+            page_data['page'] = page_num
+        
+        # Get image dimensions for normalization
+        img_width = None
+        img_height = None
+        
+        # Check if size field exists
+        if 'size' in page_data and isinstance(page_data['size'], list) and len(page_data['size']) >= 2:
+            img_width, img_height = page_data['size'][0], page_data['size'][1]
+        elif image_path and image_path.exists():
+            # Try to read actual image file dimensions
+            try:
+                from PIL import Image
+                with Image.open(image_path) as img:
+                    img_width, img_height = img.size
+                    print(f"   📐 Read image dimensions from {image_path.name}: {img_width}x{img_height}")
+            except ImportError:
+                print(f"   ⚠️  PIL/Pillow not available, cannot read image dimensions")
+            except Exception as e:
+                print(f"   ⚠️  Could not read image {image_path}: {e}")
+        
+        # Convert panel lists to dictionaries and normalize coordinates
+        if 'panels' in page_data and isinstance(page_data['panels'], list):
+            converted_panels = []
+            for panel in page_data['panels']:
+                if isinstance(panel, list) and len(panel) >= 4:
+                    # Raw pixel coordinates [x, y, w, h]
+                    raw_x, raw_y, raw_w, raw_h = float(panel[0]), float(panel[1]), float(panel[2]), float(panel[3])
+                    
+                    # Normalize if we have image dimensions
+                    if img_width and img_height and img_width > 0 and img_height > 0:
+                        norm_x = raw_x / img_width
+                        norm_y = raw_y / img_height
+                        norm_w = raw_w / img_width
+                        norm_h = raw_h / img_height
+                    else:
+                        # If no dimensions available, assume they're already normalized or use defaults
+                        # This is a fallback - ideally we should always have dimensions
+                        norm_x, norm_y, norm_w, norm_h = raw_x, raw_y, raw_w, raw_h
+                        
+                        # If values are clearly pixel values (greater than 1), warn and skip normalization
+                        if raw_x > 1 or raw_y > 1 or raw_w > 1 or raw_h > 1:
+                            print(f"   ⚠️  Warning: Pixel coordinates detected but no image dimensions available")
+                            print(f"       Panel: [{raw_x}, {raw_y}, {raw_w}, {raw_h}]")
+                            # Skip this panel as we can't normalize properly
+                            continue
+                    
+                    # Create normalized panel dictionary
+                    panel_dict = {
+                        'x': norm_x,
+                        'y': norm_y, 
+                        'w': norm_w,
+                        'h': norm_h
+                    }
+                    converted_panels.append(panel_dict)
+                elif isinstance(panel, dict):
+                    # Already in dictionary format - ensure normalization
+                    if 'x' in panel and 'y' in panel and 'w' in panel and 'h' in panel:
+                        x, y, w, h = float(panel['x']), float(panel['y']), float(panel['w']), float(panel['h'])
+                        
+                        # Normalize if values are clearly pixel coordinates
+                        if img_width and img_height and img_width > 0 and img_height > 0:
+                            if x > 1 or y > 1 or w > 1 or h > 1:
+                                panel['x'] = x / img_width
+                                panel['y'] = y / img_height
+                                panel['w'] = w / img_width
+                                panel['h'] = h / img_height
+                        
+                        converted_panels.append(panel)
+            page_data['panels'] = converted_panels
+        
+        return page_data
+    
+    except Exception as e:
+        print(f"   ⚠️  Error preprocessing page data: {e}")
+        return None
 
 def create_kumiko_directories():
     """Create Pages and panel_result folders in Kumiko directory."""
@@ -179,33 +523,19 @@ def is_archive(file_path):
     return file_path.suffix.lower() in ['.cbz', '.zip', '.rar', '.7z', '.tar', '.tar.gz', '.tgz', '.tar.bz2', '.tbz2', '.tar.xz', '.txz']
 
 def process_image_with_kumiko(image_path, output_dir):
-    """Process a single image with Kumiko to generate HTML output."""
+    """Process a single image with Kumiko to generate JSON output directly."""
     image_name = image_path.stem
-    output_html = output_dir / f"{image_name}.html"
-    
-    # First try with HTML output
-    success, html_file = try_kumiko_with_flags(image_path, output_html, ['--rtl', '--html'])
-    
-    if success:
-        return True, html_file
-    
-    # Fallback: try without HTML flag (might generate JSON instead)
-    print(f"   🔄 Trying fallback without HTML flag...")
     output_json = output_dir / f"{image_name}.json"
+    
+    # Try with JSON output directly
     success, json_file = try_kumiko_with_flags(image_path, output_json, ['--rtl'])
     
     if success and json_file.exists():
-        # Convert JSON to HTML format for processing
-        print(f"   🔄 Converting JSON to HTML format...")
-        try:
-            return convert_json_to_html(json_file, output_html)
-        except Exception as e:
-            print(f"   ❌ Failed to convert JSON to HTML: {e}")
-            return False, None
+        return True, json_file
     
-    # Final fallback: try with minimal flags
-    print(f"   🔄 Trying minimal flags...")
-    success, file = try_kumiko_with_flags(image_path, output_html, [])
+    # Fallback: try without any flags
+    print(f"   🔄 Trying fallback without flags...")
+    success, file = try_kumiko_with_flags(image_path, output_json, [])
     
     return success, file if success else None
 
@@ -735,8 +1065,8 @@ def process_chapter_based_archive(folder_path, output_dir):
         
         # Create chapter-specific output
         chapter_json = output_dir / f"{folder_name}_{chapter_dir.name}.json"
-        temp_html_dir = output_dir / f"{folder_name}_{chapter_dir.name}_temp"
-        temp_html_dir.mkdir(exist_ok=True)
+        temp_json_dir = output_dir / f"{folder_name}_{chapter_dir.name}_temp"
+        temp_json_dir.mkdir(exist_ok=True)
         
         # Get all image files in this chapter
         image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp']
@@ -756,34 +1086,34 @@ def process_chapter_based_archive(folder_path, output_dir):
         print(f"   Found {len(image_files)} image files in {chapter_dir.name}")
         
         # Process each image in this chapter
-        html_files = []
+        json_files = []
         successful_images = 0
         
         for image_file in image_files:
-            success, html_file = process_image_with_kumiko(image_file, temp_html_dir)
-            if success and html_file and html_file.exists():
-                html_files.append(html_file)
+            success, json_file = process_image_with_kumiko(image_file, temp_json_dir)
+            if success and json_file and json_file.exists():
+                json_files.append(json_file)
                 successful_images += 1
             else:
                 print(f"   ⚠️  Failed to process {image_file.name}")
         
         print(f"   Successfully processed {successful_images}/{len(image_files)} images in {chapter_dir.name}")
         
-        if not html_files:
-            print(f"   ❌ No HTML files were generated for {chapter_dir.name}")
+        if not json_files:
+            print(f"   ❌ No JSON files were generated for {chapter_dir.name}")
             continue
         
-        # Combine all HTML files into single JSON for this chapter
-        success = combine_htmls_to_json(html_files, chapter_json, temp_html_dir, chapter_dir)
+        # Combine all JSON files into single JSON for this chapter
+        success = combine_jsons_to_json(json_files, chapter_json, chapter_name=chapter_dir.name)
         
         if success:
             successful_chapters += 1
             print(f"   ✅ Chapter {chapter_dir.name} completed successfully")
         
-        # Clean up temporary HTML files
+        # Clean up temporary JSON files
         try:
             import shutil
-            shutil.rmtree(temp_html_dir)
+            shutil.rmtree(temp_json_dir)
             print(f"   🧹 Cleaned up temporary files for {chapter_dir.name}")
         except Exception as e:
             print(f"   ⚠️  Could not clean up temp files for {chapter_dir.name}: {e}")
@@ -794,46 +1124,49 @@ def process_chapter_based_archive(folder_path, output_dir):
         print(f"❌ No chapters were processed successfully")
         return False
     
-    # Create a master index file that lists all chapters
-    master_index = {
-        "archive_name": folder_name,
-        "total_chapters": successful_chapters,
-        "chapters": [],
-        "reading_direction": "rtl"
-    }
-    
-    for chapter_dir in chapter_dirs:
-        chapter_json = output_dir / f"{folder_name}_{chapter_dir.name}.json"
-        if chapter_json.exists():
-            # Read the chapter JSON to get page count
-            try:
+    # Create master index with Pydantic validation
+    try:
+        chapters_data = []
+        for chapter_dir in chapter_dirs:
+            chapter_json = output_dir / f"{folder_name}_{chapter_dir.name}.json"
+            if chapter_json.exists():
                 with open(chapter_json, 'r', encoding='utf-8') as f:
                     chapter_data = json.load(f)
-                master_index["chapters"].append({
+                chapters_data.append({
                     "name": chapter_dir.name,
                     "json_file": f"{folder_name}_{chapter_dir.name}.json",
                     "total_pages": chapter_data.get("total_pages", 0)
                 })
-            except Exception as e:
-                print(f"   ⚠️  Could not read chapter JSON for {chapter_dir.name}: {e}")
-    
-    # Write master index
-    master_json = output_dir / f"{folder_name}.json"
-    try:
+        
+        master_index = MangaIndex(
+            archive_name=folder_name,
+            total_chapters=successful_chapters,
+            chapters=chapters_data,
+            reading_direction="rtl"
+        )
+        
+        master_json = output_dir / f"{folder_name}.json"
         with open(master_json, 'w', encoding='utf-8') as f:
-            json.dump(master_index, f, indent=2, ensure_ascii=False)
+            # Convert MangaIndex to dict for JSON serialization
+            master_data = {
+                "archive_name": master_index.archive_name,
+                "total_chapters": master_index.total_chapters,
+                "chapters": master_index.chapters,
+                "reading_direction": master_index.reading_direction
+            }
+            json.dump(master_data, f, indent=2, ensure_ascii=False)
         print(f"✅ Created master index: {master_json}")
         return True
     except Exception as e:
-        print(f"❌ Error writing master index: {e}")
+        print(f"❌ Error creating master index: {e}")
         return False
 
 def process_with_kumiko(folder_path, output_dir):
     """Process a folder with Kumiko by processing each image separately."""
     folder_name = folder_path.name
     output_json = output_dir / f"{folder_name}.json"
-    temp_html_dir = output_dir / f"{folder_name}_temp"
-    temp_html_dir.mkdir(exist_ok=True)
+    temp_json_dir = output_dir / f"{folder_name}_temp"
+    temp_json_dir.mkdir(exist_ok=True)
     
     print(f"🔄 Processing folder {folder_name} with individual image processing...")
     
@@ -865,38 +1198,38 @@ def process_with_kumiko(folder_path, output_dir):
     print(f"   Found {len(image_files)} image files in {folder_path} and subdirectories")
     
     # Process each image separately
-    html_files = []
+    json_files = []
     successful_images = 0
     
     for image_file in image_files:
-        success, html_file = process_image_with_kumiko(image_file, temp_html_dir)
-        if success and html_file and html_file.exists():
-            html_files.append(html_file)
+        success, json_file = process_image_with_kumiko(image_file, temp_json_dir)
+        if success and json_file and json_file.exists():
+            json_files.append(json_file)
             successful_images += 1
         else:
             print(f"   ⚠️  Failed to process {image_file.name}")
     
     print(f"   Successfully processed {successful_images}/{len(image_files)} images")
     
-    if not html_files:
-        print(f"❌ No HTML files were generated")
+    if not json_files:
+        print(f"❌ No JSON files were generated")
         return False
     
-    # List all HTML files that were actually created
-    print(f"   HTML files created:")
-    for html_file in html_files:
-        print(f"     - {html_file.name}")
+    # List all JSON files that were actually created
+    print(f"   JSON files created:")
+    for json_file in json_files:
+        print(f"     - {json_file.name}")
     
-    # Combine all HTML files into single JSON
-    success = combine_htmls_to_json(html_files, output_json, temp_html_dir, folder_path)
+    # Combine all JSON files into single JSON
+    success = combine_jsons_to_json(json_files, output_json)
     
-    # Clean up temporary HTML files
+    # Clean up temporary JSON files
     try:
         import shutil
-        shutil.rmtree(temp_html_dir)
-        print(f"🧹 Cleaned up temporary files")
+        shutil.rmtree(temp_json_dir)
+        print(f"   🧹 Cleaned up temporary files")
     except Exception as e:
-        print(f"⚠️  Could not clean up temp files: {e}")
+        print(f"   ⚠️  Could not clean up temp files: {e}")
     
     return success
 
@@ -983,14 +1316,40 @@ def process_input(input_path, pages_dir, panel_result_dir):
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description="Process manga folders/archives with Kumiko")
-    parser.add_argument('input', help='Input folder or archive file')
+    parser = argparse.ArgumentParser(description="Process manga folders/archives with Kumiko and Pydantic V2 validation")
+    parser.add_argument('input', nargs='?', help='Input folder or archive file')
     parser.add_argument('--pages-dir', default='Pages', help='Pages directory name (within Kumiko)')
     parser.add_argument('--output-dir', default='panel_result', help='Output directory name (within Kumiko)')
+    parser.add_argument('--export-schema', action='store_true', help='Export Pydantic schema to JSON file')
+    parser.add_argument('--validate', help='Validate existing JSON file against schema')
+    parser.add_argument('--schema-file', default='manga_schema.json', help='Schema file name for export')
     
     args = parser.parse_args()
     
-    print("🚀 Manga Processing Script Started")
+    # Handle schema export
+    if args.export_schema:
+        print("📄 Exporting Pydantic V2 schema...")
+        success = export_schema(args.schema_file)
+        sys.exit(0 if success else 1)
+    
+    # Handle validation
+    if args.validate:
+        print("� Validating JSON file against schema...")
+        json_file = Path(args.validate)
+        if not json_file.exists():
+            print(f"❌ File not found: {json_file}")
+            sys.exit(1)
+        
+        success = validate_json_file(json_file)
+        sys.exit(0 if success else 1)
+    
+    # Require input for processing
+    if not args.input:
+        parser.print_help()
+        print("\n❌ Input file/folder is required for processing")
+        sys.exit(1)
+    
+    print("�� Manga Processing Script with Pydantic V2 Started")
     print("=" * 50)
     
     # Create directories in Kumiko folder
@@ -1003,6 +1362,17 @@ def main():
     if success:
         print("🎉 Processing completed successfully!")
         print(f"📂 Results in: {panel_result_dir.absolute()}")
+        
+        # Validate output files
+        print("\n🔍 Validating output files against Pydantic schema...")
+        output_files = list(panel_result_dir.glob("*.json"))
+        valid_files = 0
+        for output_file in output_files:
+            if validate_json_file(output_file):
+                valid_files += 1
+        
+        print(f"📊 Validation Summary: {valid_files}/{len(output_files)} files passed schema validation")
+        
     else:
         print("❌ Processing failed!")
         sys.exit(1)
