@@ -18,9 +18,9 @@ To ensure the plugin works correctly, apply the following settings:
 
 ## Available detection algorithms:
 
-* Kumiko - opencv, cpu
+* Kumiko - opencv, cpu - fast, simple layouts
 * YOLO - min 1050 ti 4gb - CUDA*
-* MAGI - min 1050 ti 4gb - CUDA*
+* MAGI - min 1050 ti 4gb - CUDA* - overall best result
 
 NVIDIA Driver: Version 530+ (for CUDA 12 support).
 CUDA Toolkit: 11.8 for older cards like the 1050 Ti
