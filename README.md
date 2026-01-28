@@ -16,6 +16,7 @@ CUDA Toolkit: 11.8 for older cards like the 1050 Ti
 To ensure the plugin works correctly, apply the following settings:
 
 * **Zoom:** Fit full page
+* **Page Crop:** none
 
 ## Installation
 
