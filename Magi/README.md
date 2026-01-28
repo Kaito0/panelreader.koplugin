@@ -19,6 +19,6 @@ Linux: source .venv/bin/activate
 Note: Once activated, you will usually see (.venv) appear in parentheses at the start of your command prompt line.
 
 ## 3. Install Requirements
-Now that the environment is active, install your dependencies from requirements.txt file:
+Now that the environment is active, install dependencies from requirements.txt file:
 
 pip install -r requirements.txt
