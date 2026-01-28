@@ -11,6 +11,12 @@ A panel-to-panel navigation system for KOReader that provides automated transiti
 NVIDIA Driver: Version 530+ (for CUDA 12 support).
 CUDA Toolkit: 11.8 for older cards like the 1050 Ti
 
+## Required KOReader Settings
+
+To ensure the plugin works correctly, apply the following settings:
+
+* **Zoom:** Fit full page
+
 ## Installation
 
 ### 1. Plugin Setup
