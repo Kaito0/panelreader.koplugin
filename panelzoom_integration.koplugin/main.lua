@@ -30,6 +30,7 @@ local PanelZoomIntegration = WidgetContainer:extend{
     _original_genPanelZoomMenu = nil, -- Store original panel zoom menu function
     _json_available = false, -- Track if JSON is available for current document
     reading_direction_override = nil, -- User override for reading direction (rtl/ltr)
+    bayer_dithering_enabled = true, -- Toggle between Bayer and built-in dithering
 }
 
 function PanelZoomIntegration:init()
@@ -879,6 +880,7 @@ function PanelZoomIntegration:displayCurrentPanel()
         fullscreen = true,
         buttons_visible = false,
         reading_direction = self:getEffectiveReadingDirection(),
+        bayer_dithering_enabled = self.bayer_dithering_enabled,
         onNext = function() self:nextPanel() end,
         onPrev = function() self:prevPanel() end,
         onClose = function() 
@@ -958,6 +960,21 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
                     },
                 },
                 separator = true,
+            })
+            
+            -- Add dithering mode toggle after reading direction
+            table.insert(menu_items, 2, {
+                text = _("Bayer Dithering"),
+                checked_func = function()
+                    return self.bayer_dithering_enabled
+                end,
+                callback = function()
+                    self.bayer_dithering_enabled = not self.bayer_dithering_enabled
+                    logger.info(string.format("PanelZoom: Bayer dithering %s", 
+                        self.bayer_dithering_enabled and "enabled" or "disabled (using built-in)"))
+                    self:refreshCurrentPanelIfActive()
+                end,
+                help_text = _("Toggle between custom Bayer dithering and KOReader's built-in dithering"),
             })
             
             return menu_items

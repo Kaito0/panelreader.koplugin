@@ -6,7 +6,116 @@ inspired by modern image rendering patterns. It provides optimized panel
 viewing with custom padding, gesture handling, and smooth transitions.
 ]]
 
+local ffi = require("ffi")
 local Blitbuffer = require("ffi/blitbuffer")
+
+-- Bayer 8x8 Threshold Map
+local BAYER_8x8 = {
+    { 0, 32,  8, 40,  2, 34, 10, 42},
+    {48, 16, 56, 24, 50, 18, 58, 26},
+    {12, 44,  4, 36, 14, 46,  6, 38},
+    {60, 28, 68, 20, 62, 30, 70, 22},
+    { 3, 35, 11, 43,  1, 33,  9, 41},
+    {51, 19, 59, 27, 49, 17, 57, 25},
+    {15, 47,  7, 39, 13, 45,  5, 37},
+    {63, 31, 71, 23, 61, 29, 69, 21}
+}
+
+-- Optimization: Pre-scale matrix to 0-255 range with white headroom
+local white_headroom = 20 -- Increase this to clear more white space
+for y = 1, 8 do
+    for x = 1, 8 do
+        -- Thresholds now range from 20 to 272 (capped at 255)
+        BAYER_8x8[y][x] = math.min(255, (BAYER_8x8[y][x] * 4) + white_headroom)
+    end
+end
+
+local function applyBayer8x8(bb)
+    local w, h = bb:getWidth(), bb:getHeight()
+    local data = ffi.cast("unsigned char*", bb.data)
+    local stride = bb.stride
+    local bb_type = bb:getType()
+    
+    -- CONFIG: Pixels above this value (0-255) will be forced to pure white
+    -- This removes dithering artifacts from "dirty" white backgrounds
+    local white_point = 235 
+
+    -- Handle different blitbuffer types
+    if bb_type == Blitbuffer.TYPE_BB8 then
+        -- Grayscale: Apply dithering directly
+        for y = 0, h - 1 do
+            local y_offset = y * stride
+            local matrix_row = BAYER_8x8[(y % 8) + 1]
+            for x = 0, w - 1 do
+                local idx = y_offset + x
+                local val = data[idx]
+                
+                -- Force clean whites
+                if val >= white_point then
+                    data[idx] = 255
+                else
+                    data[idx] = val > matrix_row[(x % 8) + 1] and 255 or 0
+                end
+            end
+        end
+    elseif bb_type == Blitbuffer.TYPE_BBRGB32 then
+        -- RGB32: Convert to grayscale first, then dither
+        for y = 0, h - 1 do
+            local y_offset = y * stride
+            local matrix_row = BAYER_8x8[(y % 8) + 1]
+            for x = 0, w - 1 do
+                local pixel_offset = y_offset + (x * 4)
+                local r = data[pixel_offset]
+                local g = data[pixel_offset + 1] 
+                local b = data[pixel_offset + 2]
+                -- Convert to grayscale using standard weights
+                local gray = math.floor(0.299 * r + 0.587 * g + 0.114 * b + 0.5)
+                
+                -- Force clean whites
+                if gray >= white_point then
+                    gray = 255
+                else
+                    gray = gray > matrix_row[(x % 8) + 1] and 255 or 0
+                end
+                
+                -- Write back as grayscale RGB
+                data[pixel_offset] = gray
+                data[pixel_offset + 1] = gray
+                data[pixel_offset + 2] = gray
+            end
+        end
+    elseif bb_type == Blitbuffer.TYPE_BBRGB24 then
+        -- RGB24: Convert to grayscale first, then dither
+        for y = 0, h - 1 do
+            local y_offset = y * stride
+            local matrix_row = BAYER_8x8[(y % 8) + 1]
+            for x = 0, w - 1 do
+                local pixel_offset = y_offset + (x * 3)
+                local r = data[pixel_offset]
+                local g = data[pixel_offset + 1]
+                local b = data[pixel_offset + 2]
+                -- Convert to grayscale using standard weights
+                local gray = math.floor(0.299 * r + 0.587 * g + 0.114 * b + 0.5)
+                
+                -- Force clean whites
+                if gray >= white_point then
+                    gray = 255
+                else
+                    gray = gray > matrix_row[(x % 8) + 1] and 255 or 0
+                end
+                
+                -- Write back as grayscale RGB
+                data[pixel_offset] = gray
+                data[pixel_offset + 1] = gray
+                data[pixel_offset + 2] = gray
+            end
+        end
+    else
+        -- For other types, skip dithering to avoid artifacts
+        logger.warn(string.format("PanelViewer: Unsupported blitbuffer type %d for Bayer dithering", bb_type))
+        return
+    end
+end
 local Device = require("device")
 local Geom = require("ui/geometry")
 local GestureRange = require("ui/gesturerange")
@@ -31,6 +140,7 @@ local PanelViewer = InputContainer:extend{
     
     -- Panel-specific properties
     reading_direction = "ltr",
+    bayer_dithering_enabled = true, -- Toggle between Bayer and built-in dithering
     
     -- Callbacks for navigation
     onNext = nil,
@@ -97,10 +207,20 @@ function PanelViewer:loadImage()
         local screen_h = Screen:getHeight()
         logger.info(string.format("PanelViewer: Loading image file at screen size %dx%d with dithering: %s", screen_w, screen_h, self.file))
         -- Pass screen dimensions to MuPDF for high-quality scaling during decode
+        -- Force grayscale (TYPE_BB8) to prevent color artifacts
         image_bb = RenderImage:renderImageFile(self.file, false, screen_w, screen_h)
         if not image_bb then
             logger.error("PanelViewer: Failed to load image file")
             return false
+        end
+        
+        -- Convert to grayscale if not already
+        if image_bb:getType() ~= Blitbuffer.TYPE_BB8 then
+            logger.info(string.format("PanelViewer: Converting image from type %d to grayscale (TYPE_BB8)", image_bb:getType()))
+            local gray_bb = Blitbuffer.new(image_bb:getWidth(), image_bb:getHeight(), Blitbuffer.TYPE_BB8)
+            gray_bb:blitFrom(image_bb)
+            image_bb:free()
+            image_bb = gray_bb
         end
     end
     
@@ -148,12 +268,26 @@ function PanelViewer:calculateDisplayRect()
         h = display_h
     }
     
-    -- BEST: No post-scaling! Use original image directly for 1:1 blitting
-    -- The image should be rendered at final size during creation
-    self._scaled_image_bb = self._image_bb
+    -- Create dithered buffer for display if Bayer is enabled
+    -- Free existing dithered buffer if different from original
+    if self._scaled_image_bb and self._scaled_image_bb ~= self._image_bb then
+        self._scaled_image_bb:free()
+    end
     
-    logger.info(string.format("PanelViewer: Display rect %dx%d at (%d,%d) scale=%.3f (1:1 blit)", 
-        display_w, display_h, display_x, display_y, scale))
+    if self.bayer_dithering_enabled then
+        -- Create a copy and apply Bayer dithering
+        self._scaled_image_bb = self._image_bb:copy()
+        applyBayer8x8(self._scaled_image_bb)
+        logger.info("PanelViewer: Bayer dithering applied")
+    else
+        -- Use original image for built-in dithering
+        self._scaled_image_bb = self._image_bb
+        logger.info("PanelViewer: Using built-in dithering")
+    end
+    
+    logger.info(string.format("PanelViewer: Display rect %dx%d at (%d,%d) scale=%.3f (%s)", 
+        display_w, display_h, display_x, display_y, scale,
+        self.bayer_dithering_enabled and "Bayer" or "built-in"))
 end
 
 function PanelViewer:onTap(_, ges)
@@ -215,13 +349,17 @@ function PanelViewer:paintTo(bb, x, y)
         bb:paintRect(screen_rect.x + screen_rect.w, screen_rect.y, screen_w - (screen_rect.x + screen_rect.w), screen_rect.h, white_color)
     end
     
-    -- KOADER MUFPDF LOGIC: Enable dithering for E-ink displays to prevent artifacts
-    -- KOReader uses dithering for 8bpp displays and grayscale content
-    -- For manga panels on E-ink, we need dithering to avoid banding artifacts
-    if Screen.sw_dithering then
-        bb:ditherblitFrom(self._scaled_image_bb, screen_rect.x, screen_rect.y, 0, 0, screen_rect.w, screen_rect.h)
-    else
+    -- Use appropriate blitting method based on dithering mode
+    if self.bayer_dithering_enabled then
+        -- Use standard blit because we've already manually dithered the buffer
         bb:blitFrom(self._scaled_image_bb, screen_rect.x, screen_rect.y, 0, 0, screen_rect.w, screen_rect.h)
+    else
+        -- Use KOReader's built-in dithering
+        if Screen.sw_dithering then
+            bb:ditherblitFrom(self._scaled_image_bb, screen_rect.x, screen_rect.y, 0, 0, screen_rect.w, screen_rect.h)
+        else
+            bb:blitFrom(self._scaled_image_bb, screen_rect.x, screen_rect.y, 0, 0, screen_rect.w, screen_rect.h)
+        end
     end
     
     self._is_dirty = false
@@ -289,14 +427,18 @@ function PanelViewer:updateReadingDirection(direction)
 end
 
 function PanelViewer:freeResources()
-    -- BEST: No separate scaled image to free (1:1 blitting)
-    -- Only free the original if it's not externally managed
+    -- Free the original if it's not externally managed
     if self._image_bb and self._image_bb ~= self.image then
         self._image_bb:free()
         self._image_bb = nil
     end
-    self._scaled_image_bb = nil  -- Just clear the reference
-    logger.info("PanelViewer: Resources freed (1:1 blit mode)")
+    -- Free the dithered clone buffer only if using Bayer and it's different
+    if self.bayer_dithering_enabled and self._scaled_image_bb and self._scaled_image_bb ~= self._image_bb then
+        self._scaled_image_bb:free()
+    end
+    self._scaled_image_bb = nil
+    logger.info(string.format("PanelViewer: Resources freed (%s dithering mode)", 
+        self.bayer_dithering_enabled and "Bayer" or "built-in"))
 end
 
 function PanelViewer:close()
