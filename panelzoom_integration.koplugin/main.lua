@@ -350,7 +350,7 @@ function PanelZoomIntegration:drawPagePartWithSettings(pageno, rect, panel_cente
     local screen_h = Screen:getHeight()
 
     -- 2. DEFINE ABSOLUTE LIMIT SAFE ZONE
-    local padding = 2
+    local padding = 5
     local safe_w = screen_w - (padding * 2)
     local safe_h = screen_h - (padding * 2)
 
