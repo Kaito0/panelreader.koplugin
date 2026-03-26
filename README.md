@@ -14,6 +14,9 @@ KOReader-native Guided View, adapted for:
 * YOLO - min 1050 ti 4gb - CUDA*
 * MAGI - min 1050 ti 4gb - CUDA* 
 
+For the latest version use YOLO
+
+
 NVIDIA Driver: Version 530+ (for CUDA 12 support).
 CUDA Toolkit: 11.8 for older cards like the 1050 Ti
 
