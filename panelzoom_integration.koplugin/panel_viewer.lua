@@ -64,7 +64,7 @@ end
 function PanelViewer:setupTouchZones()
     local screen_width = Screen:getWidth()
     local screen_height = Screen:getHeight()
-    
+
     -- Define tap zones: Left 30% (prev), Right 30% (next), Center 40% (close)
     self.ges_events = {
         Tap = {
@@ -78,6 +78,15 @@ function PanelViewer:setupTouchZones()
             }
         }
     }
+
+    -- Physical button navigation (Kobo page-turn buttons, etc.)
+    if Device:hasKeys() then
+        self.key_events = {
+            KeyNext = { { Device.input.group.PgFwd } },
+            KeyPrev = { { Device.input.group.PgBack } },
+            KeyClose = { { Device.input.group.Back } },
+        }
+    end
 end
 
 function PanelViewer:loadImage()
@@ -183,6 +192,24 @@ function PanelViewer:onTap(_, ges)
     
     -- Center tap: Close the viewer
     logger.info("PanelViewer: Center tap detected, closing viewer")
+    if self.onClose then self.onClose() end
+    return true
+end
+
+function PanelViewer:onKeyNext()
+    logger.info("PanelViewer: Forward key detected")
+    if self.onNext then self.onNext() end
+    return true
+end
+
+function PanelViewer:onKeyPrev()
+    logger.info("PanelViewer: Backward key detected")
+    if self.onPrev then self.onPrev() end
+    return true
+end
+
+function PanelViewer:onKeyClose()
+    logger.info("PanelViewer: Close key detected")
     if self.onClose then self.onClose() end
     return true
 end
