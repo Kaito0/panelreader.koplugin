@@ -320,9 +320,10 @@ function PanelZoomIntegration:displayPreloadedPanel()
     logger.info(string.format("PanelZoom: Updated custom position for preloaded panel - x:%d, y:%d (image:%dx%d, screen:%dx%d)", 
         custom_position.x, custom_position.y, image_w, image_h, screen_w, screen_h))
     
-    self._current_imgviewer:update()
-    UIManager:setDirty(self._current_imgviewer, "ui")
-    
+    -- Full flashing refresh on panel switch: a partial "ui" refresh leaves the
+    -- previous panel ghosted behind the new one on E-ink.
+    self._current_imgviewer:update("flashui")
+
     -- Clear preloaded data after use
     self._preloaded_image = nil
     self._preloaded_panel_index = nil
