@@ -45,6 +45,10 @@ local PanelViewer = InputContainer:extend{
     _scaled_image_bb = nil, -- Cached scaled image for display
     _is_dirty = false,
 
+    -- When true, gestures settle with a flashing full refresh to clear e-ink
+    -- ghosting; when false, use a lighter partial refresh (no flash, may ghost)
+    full_refresh = true,
+
     -- Zoom / pan state
     max_zoom = 3.0,            -- upper bound for pinch zoom (memory-bounded)
     _zoom = 1.0,              -- 1.0 = fit (default paint path); > 1 = zoomed
@@ -293,7 +297,7 @@ function PanelViewer:zoomTo(new_zoom)
         self:_clampCenterRatios()
     end
     logger.info(string.format("PanelViewer: Zoom set to %.2f", self._zoom))
-    self:update("full")
+    self:update(self:_settleRefresh())
 end
 
 -- Reference dimension for turning a pinch/spread travel into a zoom ratio,
@@ -335,8 +339,8 @@ function PanelViewer:_panByPixels(fx, fy)
     self._center_x_ratio = self._center_x_ratio - (fx or 0) / zw
     self._center_y_ratio = self._center_y_ratio - (fy or 0) / zh
     self:_clampCenterRatios()
-    -- Single discrete move (swipe): full refresh to avoid leaving ghosts
-    self:update("full")
+    -- Single discrete move (swipe): settle refresh to avoid leaving ghosts
+    self:update(self:_settleRefresh())
 end
 
 -- Drag to pan. To avoid e-ink ghosting we don't repaint live: we only track
@@ -362,8 +366,8 @@ end
 function PanelViewer:onPanRelease(_, ges)
     if not self._panning then return true end
     self._panning = false
-    -- Repaint once, with a flashing full refresh to keep the panel ghost-free
-    self:update("full")
+    -- Repaint once, settle refresh to keep the panel ghost-free
+    self:update(self:_settleRefresh())
     return true
 end
 
@@ -624,6 +628,12 @@ function PanelViewer:update(refresh_type)
         return refresh_type, self.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
     end)
     logger.info("PanelViewer: Update called with refresh type " .. refresh_type)
+end
+
+-- Refresh type used when a gesture settles: flashing full refresh to clear
+-- ghosting, unless the user opted out (then a lighter partial refresh).
+function PanelViewer:_settleRefresh()
+    return self.full_refresh and "full" or "ui"
 end
 
 function PanelViewer:updateReadingDirection(direction)
