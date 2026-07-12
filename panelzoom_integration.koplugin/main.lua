@@ -31,9 +31,15 @@ local PanelZoomIntegration = WidgetContainer:extend{
     _json_available = false, -- Track if JSON is available for current document
     reading_direction_override = nil, -- User override for reading direction (rtl/ltr)
     horizontal_offset = 0,
+    full_refresh = true, -- Flashing full refresh to avoid ghosting (user-toggleable)
 }
 
 function PanelZoomIntegration:init()
+    -- Load persisted refresh preference (default: enabled)
+    if G_reader_settings then
+        self.full_refresh = G_reader_settings:nilOrTrue("panelzoom_full_refresh")
+    end
+
     -- Auto-detect JSON and integrate with Panel Zoom when document is opened
     self.onDocumentLoaded = function()
         self:checkAndIntegratePanelZoom()
@@ -320,9 +326,10 @@ function PanelZoomIntegration:displayPreloadedPanel()
     logger.info(string.format("PanelZoom: Updated custom position for preloaded panel - x:%d, y:%d (image:%dx%d, screen:%dx%d)", 
         custom_position.x, custom_position.y, image_w, image_h, screen_w, screen_h))
     
-    self._current_imgviewer:update()
-    UIManager:setDirty(self._current_imgviewer, "ui")
-    
+    -- Full flashing refresh on panel switch: a partial "ui" refresh leaves the
+    -- previous panel ghosted behind the new one on E-ink. User can disable it.
+    self._current_imgviewer:update(self.full_refresh and "flashui" or "ui")
+
     -- Clear preloaded data after use
     self._preloaded_image = nil
     self._preloaded_panel_index = nil
@@ -908,6 +915,7 @@ function PanelZoomIntegration:displayCurrentPanel()
         fullscreen = true,
         buttons_visible = false,
         reading_direction = self:getEffectiveReadingDirection(),
+        full_refresh = self.full_refresh,  -- Ghosting-avoidance refresh preference
         custom_position = custom_position,  -- Pass custom position for center matching
         panel_aspect_ratio = panel_aspect_ratio,  -- Pass panel aspect ratio for border logic
         onNext = function() self:nextPanel() end,
@@ -926,8 +934,9 @@ function PanelZoomIntegration:displayCurrentPanel()
     -- KOADER MUFPDF LOGIC: Use flashui refresh for initial panel display
     -- This ensures crisp rendering like KOReader's ImageViewer
     -- Enable dithering for E-ink displays to prevent artifacts
+    local initial_refresh = self.full_refresh and "flashui" or "ui"
     UIManager:setDirty(panel_viewer, function()
-        return "flashui", panel_viewer.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
+        return initial_refresh, panel_viewer.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
     end)
     
     logger.info("PanelZoom: New PanelViewer shown with KOReader refresh logic")
@@ -980,6 +989,25 @@ function PanelZoomIntegration:setupPanelZoomMenuIntegration()
     },
     separator = true,
 })
+
+            -- Toggle: flashing full refresh to avoid E-ink ghosting (default on)
+            table.insert(menu_items, 3, {
+                text = _("Reduce ghosting (full refresh)"),
+                checked_func = function()
+                    return self.full_refresh
+                end,
+                callback = function()
+                    self.full_refresh = not self.full_refresh
+                    if G_reader_settings then
+                        G_reader_settings:saveSetting("panelzoom_full_refresh", self.full_refresh)
+                    end
+                    if self._current_imgviewer then
+                        self._current_imgviewer.full_refresh = self.full_refresh
+                    end
+                    logger.info("PanelZoom: Full refresh set to " .. tostring(self.full_refresh))
+                end,
+                separator = true,
+            })
 
             
             -- Add reading direction submenu at the beginning

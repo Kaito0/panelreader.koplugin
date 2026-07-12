@@ -44,6 +44,21 @@ local PanelViewer = InputContainer:extend{
     _display_rect = nil,
     _scaled_image_bb = nil, -- Cached scaled image for display
     _is_dirty = false,
+
+    -- When true, gestures settle with a flashing full refresh to clear e-ink
+    -- ghosting; when false, use a lighter partial refresh (no flash, may ghost)
+    full_refresh = true,
+
+    -- Zoom / pan state
+    max_zoom = 3.0,            -- upper bound for pinch zoom (memory-bounded)
+    _zoom = 1.0,              -- 1.0 = fit (default paint path); > 1 = zoomed
+    _center_x_ratio = 0.5,    -- image point shown at screen center (0..1)
+    _center_y_ratio = 0.5,
+    _zoomed_bb = nil,         -- cached upscaled buffer for current zoom level
+    _zoomed_for = nil,        -- zoom value _zoomed_bb was built at
+    _panning = false,
+    _pan_start_cx = 0.5,
+    _pan_start_cy = 0.5,
 }
 
 function PanelViewer:init()
@@ -66,17 +81,20 @@ function PanelViewer:setupTouchZones()
     local screen_height = Screen:getHeight()
 
     -- Define tap zones: Left 30% (prev), Right 30% (next), Center 40% (close)
+    local full_range = Geom:new{
+        x = 0, y = 0,
+        w = screen_width,
+        h = screen_height
+    }
     self.ges_events = {
-        Tap = {
-            GestureRange:new{
-                ges = "tap",
-                range = Geom:new{
-                    x = 0, y = 0,
-                    w = screen_width,
-                    h = screen_height
-                }
-            }
-        }
+        Tap = { GestureRange:new{ ges = "tap", range = full_range } },
+        -- Pinch/spread to zoom (fired once on finger lift)
+        Spread = { GestureRange:new{ ges = "spread", range = full_range } },
+        Pinch = { GestureRange:new{ ges = "pinch", range = full_range } },
+        -- Drag/swipe to pan when zoomed in
+        Pan = { GestureRange:new{ ges = "pan", range = full_range } },
+        PanRelease = { GestureRange:new{ ges = "pan_release", range = full_range } },
+        Swipe = { GestureRange:new{ ges = "swipe", range = full_range } },
     }
 
     -- Physical button navigation (Kobo page-turn buttons, etc.)
@@ -190,6 +208,13 @@ function PanelViewer:onTap(_, ges)
         return true
     end
     
+    -- Center tap while zoomed: reset back to fit instead of closing
+    if self._zoom > 1.0 then
+        logger.info("PanelViewer: Center tap while zoomed, resetting to fit")
+        self:zoomTo(1.0)
+        return true
+    end
+
     -- Center tap: Close the viewer
     logger.info("PanelViewer: Center tap detected, closing viewer")
     if self.onClose then self.onClose() end
@@ -214,8 +239,220 @@ function PanelViewer:onKeyClose()
     return true
 end
 
+-- === Zoom / pan ===========================================================
+
+-- Build (or reuse) the upscaled buffer for the current zoom level. Uses
+-- MuPDF's C scaler via RenderImage for speed/quality; the source panel image
+-- is never freed (free_orig_bb = false).
+function PanelViewer:_ensureZoomedBuffer()
+    if not self._image_bb or not self._rendered_size then return end
+    if self._zoomed_bb and self._zoomed_for == self._zoom then return end
+    if self._zoomed_bb and self._zoomed_bb ~= self._image_bb then
+        self._zoomed_bb:free()
+    end
+    self._zoomed_bb = nil
+    local zw = math.floor(self._rendered_size.w * self._zoom + 0.5)
+    local zh = math.floor(self._rendered_size.h * self._zoom + 0.5)
+    self._zoomed_bb = RenderImage:scaleBlitBuffer(self._image_bb, zw, zh, false)
+    self._zoomed_for = self._zoom
+end
+
+-- Keep the viewport within the image bounds (or centered if smaller).
+function PanelViewer:_clampCenterRatios()
+    local sw = Screen:getWidth()
+    local sh = Screen:getHeight()
+    local zw = self._rendered_size.w * self._zoom
+    local zh = self._rendered_size.h * self._zoom
+    if zw <= sw then
+        self._center_x_ratio = 0.5
+    else
+        local margin = (sw / 2) / zw
+        self._center_x_ratio = math.max(margin, math.min(1 - margin, self._center_x_ratio))
+    end
+    if zh <= sh then
+        self._center_y_ratio = 0.5
+    else
+        local margin = (sh / 2) / zh
+        self._center_y_ratio = math.max(margin, math.min(1 - margin, self._center_y_ratio))
+    end
+end
+
+function PanelViewer:zoomTo(new_zoom)
+    new_zoom = math.max(1.0, math.min(self.max_zoom, new_zoom))
+    if new_zoom == self._zoom then return end
+
+    if new_zoom <= 1.0 then
+        -- Exit zoom mode: drop cache, recenter, repaint with default path
+        self._zoom = 1.0
+        self._center_x_ratio = 0.5
+        self._center_y_ratio = 0.5
+        if self._zoomed_bb and self._zoomed_bb ~= self._image_bb then
+            self._zoomed_bb:free()
+        end
+        self._zoomed_bb = nil
+        self._zoomed_for = nil
+    else
+        self._zoom = new_zoom
+        self:_ensureZoomedBuffer()
+        self:_clampCenterRatios()
+    end
+    logger.info(string.format("PanelViewer: Zoom set to %.2f", self._zoom))
+    self:update(self:_settleRefresh())
+end
+
+-- Reference dimension for turning a pinch/spread travel into a zoom ratio,
+-- mirroring ImageViewer: relative to the smaller of screen vs current image.
+function PanelViewer:_zoomRefDim(direction)
+    local sw = Screen:getWidth()
+    local sh = Screen:getHeight()
+    local iw = self._rendered_size.w * self._zoom
+    local ih = self._rendered_size.h * self._zoom
+    if direction == "horizontal" then
+        return math.min(sw, iw)
+    elseif direction == "vertical" then
+        return math.min(sh, ih)
+    end
+    return math.min(math.sqrt(sw * sw + sh * sh), math.sqrt(iw * iw + ih * ih))
+end
+
+function PanelViewer:onSpread(_, ges)
+    if not ges or not ges.distance then return true end
+    local inc = ges.distance / self:_zoomRefDim(ges.direction)
+    self:zoomTo(self._zoom * (1 + inc))
+    return true
+end
+
+function PanelViewer:onPinch(_, ges)
+    if not ges or not ges.distance then return true end
+    local dec = ges.distance / self:_zoomRefDim(ges.direction)
+    if dec >= 0.75 then dec = 0.75 end  -- large reductions are jarring
+    self:zoomTo(self._zoom * (1 - dec))
+    return true
+end
+
+-- Shift the centered point by a finger movement (screen pixels). The content
+-- follows the finger, so the centered image pixel moves opposite, scaled by
+-- the current zoomed dimensions.
+function PanelViewer:_panByPixels(fx, fy)
+    local zw = self._rendered_size.w * self._zoom
+    local zh = self._rendered_size.h * self._zoom
+    self._center_x_ratio = self._center_x_ratio - (fx or 0) / zw
+    self._center_y_ratio = self._center_y_ratio - (fy or 0) / zh
+    self:_clampCenterRatios()
+    -- Single discrete move (swipe): settle refresh to avoid leaving ghosts
+    self:update(self:_settleRefresh())
+end
+
+-- Drag to pan. To avoid e-ink ghosting we don't repaint live: we only track
+-- the new center during the drag and repaint once on release. ges.relative is
+-- cumulative from the gesture start, so we re-anchor from the touch-down center.
+function PanelViewer:onPan(_, ges)
+    -- Only pan when zoomed in; otherwise let taps/navigation handle it
+    if self._zoom <= 1.0 then return false end
+    if not self._panning then
+        self._panning = true
+        self._pan_start_cx = self._center_x_ratio
+        self._pan_start_cy = self._center_y_ratio
+    end
+    local rel = ges and ges.relative or { x = 0, y = 0 }
+    local zw = self._rendered_size.w * self._zoom
+    local zh = self._rendered_size.h * self._zoom
+    self._center_x_ratio = self._pan_start_cx - (rel.x or 0) / zw
+    self._center_y_ratio = self._pan_start_cy - (rel.y or 0) / zh
+    self:_clampCenterRatios()
+    return true
+end
+
+function PanelViewer:onPanRelease(_, ges)
+    if not self._panning then return true end
+    self._panning = false
+    -- Repaint once, settle refresh to keep the panel ghost-free
+    self:update(self:_settleRefresh())
+    return true
+end
+
+-- Fast finger drags register as swipes rather than pans; treat them as panning
+-- when zoomed so the user can reach the off-screen parts of a big panel.
+function PanelViewer:onSwipe(_, ges)
+    if self._zoom <= 1.0 then return false end
+    local d = (ges and ges.distance) or 0
+    local sq = math.sqrt(d * d / 2)
+    local dir = ges and ges.direction
+    if dir == "east" then
+        self:_panByPixels(d, 0)
+    elseif dir == "west" then
+        self:_panByPixels(-d, 0)
+    elseif dir == "north" then
+        self:_panByPixels(0, -d)
+    elseif dir == "south" then
+        self:_panByPixels(0, d)
+    elseif dir == "northeast" then
+        self:_panByPixels(sq, -sq)
+    elseif dir == "northwest" then
+        self:_panByPixels(-sq, -sq)
+    elseif dir == "southeast" then
+        self:_panByPixels(sq, sq)
+    elseif dir == "southwest" then
+        self:_panByPixels(-sq, sq)
+    else
+        return false
+    end
+    return true
+end
+
+-- Paint the zoomed viewport: a screen-sized window into the upscaled buffer,
+-- centered on (_center_x_ratio, _center_y_ratio), white where it falls short.
+function PanelViewer:_paintZoomed(bb, x, y)
+    local sw = Screen:getWidth()
+    local sh = Screen:getHeight()
+    local zbb = self._zoomed_bb
+    local zw = zbb:getWidth()
+    local zh = zbb:getHeight()
+    local white = Blitbuffer.Color8(255)
+
+    bb:paintRect(x, y, sw, sh, white)
+
+    local vx = math.floor(self._center_x_ratio * zw - sw / 2 + 0.5)
+    local vy = math.floor(self._center_y_ratio * zh - sh / 2 + 0.5)
+    if zw <= sw then
+        vx = math.floor((zw - sw) / 2)
+    else
+        vx = math.max(0, math.min(zw - sw, vx))
+    end
+    if zh <= sh then
+        vy = math.floor((zh - sh) / 2)
+    else
+        vy = math.max(0, math.min(zh - sh, vy))
+    end
+
+    local dst_x = vx < 0 and -vx or 0
+    local dst_y = vy < 0 and -vy or 0
+    local src_x = vx > 0 and vx or 0
+    local src_y = vy > 0 and vy or 0
+    local cw = math.min(sw - dst_x, zw - src_x)
+    local ch = math.min(sh - dst_y, zh - src_y)
+
+    if cw > 0 and ch > 0 then
+        if Screen.sw_dithering then
+            bb:ditherblitFrom(zbb, x + dst_x, y + dst_y, src_x, src_y, cw, ch)
+        else
+            bb:blitFrom(zbb, x + dst_x, y + dst_y, src_x, src_y, cw, ch)
+        end
+    end
+
+    self._is_dirty = false
+end
+
 function PanelViewer:paintTo(bb, x, y)
-    if not self._image_bb or not self._scaled_image_bb then return end
+    if not self._image_bb then return end
+
+    -- Zoomed: render the pan viewport and skip the fit-view border drawing
+    if self._zoom > 1.0 and self._zoomed_bb then
+        self:_paintZoomed(bb, x, y)
+        return
+    end
+
+    if not self._scaled_image_bb then return end
     
     -- Get screen-space rectangle (single source of truth)
     local screen_rect = self:getScreenRect()
@@ -361,24 +598,42 @@ function PanelViewer:updateImage(new_image)
         self._image_bb:free()
     end
     
+    -- Reset zoom/pan for the new panel
+    if self._zoomed_bb and self._zoomed_bb ~= self._image_bb then
+        self._zoomed_bb:free()
+    end
+    self._zoomed_bb = nil
+    self._zoomed_for = nil
+    self._zoom = 1.0
+    self._center_x_ratio = 0.5
+    self._center_y_ratio = 0.5
+    self._panning = false
+
     self.image = new_image
     self._image_bb = new_image
     self:loadImage()
     self:calculateDisplayRect()
     self._is_dirty = true
-    
+
     logger.info("PanelViewer: Image updated")
 end
 
-function PanelViewer:update()
-    -- KOADER MUFPDF LOGIC: Use proper refresh types like ImageViewer
-    -- For panel viewing, we want "ui" refresh for smooth transitions
-    -- and "flashui" for initial display to ensure crisp rendering
+function PanelViewer:update(refresh_type)
+    -- KOADER MUFPDF LOGIC: Use proper refresh types like ImageViewer.
+    -- "ui" for smooth intermediate frames; "full" to clear e-ink ghosting
+    -- once a gesture (pan/zoom) settles.
+    refresh_type = refresh_type or "ui"
     self._is_dirty = true
     UIManager:setDirty(self, function()
-        return "ui", self.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
+        return refresh_type, self.dimen, Screen.sw_dithering  -- Enable dithering for E-ink
     end)
-    logger.info("PanelViewer: Update called with KOReader refresh logic")
+    logger.info("PanelViewer: Update called with refresh type " .. refresh_type)
+end
+
+-- Refresh type used when a gesture settles: flashing full refresh to clear
+-- ghosting, unless the user opted out (then a lighter partial refresh).
+function PanelViewer:_settleRefresh()
+    return self.full_refresh and "full" or "ui"
 end
 
 function PanelViewer:updateReadingDirection(direction)
@@ -396,6 +651,11 @@ end
 function PanelViewer:freeResources()
     -- BEST: No separate scaled image to free (1:1 blitting)
     -- Only free the original if it's not externally managed
+    if self._zoomed_bb and self._zoomed_bb ~= self._image_bb then
+        self._zoomed_bb:free()
+    end
+    self._zoomed_bb = nil
+    self._zoomed_for = nil
     if self._image_bb and self._image_bb ~= self.image then
         self._image_bb:free()
         self._image_bb = nil
