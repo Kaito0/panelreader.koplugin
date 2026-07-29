@@ -402,7 +402,10 @@ custom_position.x = custom_position.x + (self.horizontal_offset or -2)
     scaled_rect:transformByScale(final_scale, final_scale)
     rect.scaled_rect = scaled_rect
 
-    local tile = self.ui.document:renderPage(pageno, rect, final_scale, 0, gamma, true)
+    -- KOReader v2026.07 inserted a `saturation` arg before `hinting`:
+    -- renderPage(pageno, rect, zoom, rotation, gamma, saturation, hinting).
+    -- Pass 1.0 (neutral) for saturation, matching Document:drawPagePart.
+    local tile = self.ui.document:renderPage(pageno, rect, final_scale, 0, gamma, 1.0, true)
     local image = tile.bb
 
     -- 8. POST-PROCESSING
